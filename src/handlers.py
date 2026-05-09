@@ -24,6 +24,13 @@ from .media import (
 )
 from .summarize import SummarizeError, Summaries, summarize_all_levels
 from .transcribe import TranscribeError, transcribe_chunks
+from .youtube import (
+    YouTubeNotApplicable,
+    YouTubeTranscript,
+    YouTubeTranscriptError,
+    fetch_transcript as fetch_youtube_transcript,
+    is_youtube_url,
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -111,6 +118,11 @@ async def _handle(msg: Message, bot: Bot, source: str) -> None:
         progress = await msg.answer("🔄 Принял. Готовлю…")
         workdir = make_workdir()
         try:
+            # YouTube: пропускаем yt-dlp+Whisper, берём субтитры через API.
+            if source == "url" and is_youtube_url(extract_url(msg.text or "") or ""):
+                await _handle_youtube(msg, progress, user_id)
+                return
+
             if source == "url":
                 media = await _download_from_url_with_progress(msg, progress, workdir)
             else:
@@ -142,6 +154,8 @@ async def _handle(msg: Message, bot: Bot, source: str) -> None:
 
         except MediaError as e:
             await progress.edit_text(f"❌ {e}")
+        except YouTubeTranscriptError as e:
+            await progress.edit_text(f"❌ YouTube: {e}")
         except TranscribeError as e:
             await progress.edit_text(f"❌ Транскрипция: {e}")
         except SummarizeError as e:
@@ -151,6 +165,46 @@ async def _handle(msg: Message, bot: Bot, source: str) -> None:
             await progress.edit_text("❌ Что-то пошло не так. Я записал ошибку, попробуй ещё раз.")
         finally:
             cleanup_workdir(workdir)
+
+
+async def _handle_youtube(msg: Message, progress: Message, user_id: int) -> None:
+    """YouTube-flow: берём субтитры напрямую через API, без yt-dlp и Whisper."""
+    url = extract_url(msg.text or "") or ""
+    await progress.edit_text("📝 Беру субтитры YouTube…")
+    yt = await fetch_youtube_transcript(url)
+
+    if not yt.text.strip():
+        await progress.edit_text("🤷 Субтитры YouTube пустые — попробуй другое видео.")
+        return
+
+    duration_min = yt.duration_seconds / 60
+    ok, reason = rate_limit.can_process(user_id, duration_min)
+    if not ok:
+        await progress.edit_text(reason)
+        return
+    rate_limit.record_usage(user_id, duration_min)
+
+    src = "ручные" if not yt.is_generated else "авто-сгенерированные"
+    await progress.edit_text(
+        f"✍️ Субтитры получены ({yt.language}, {src}). Делаю три уровня пересказа…"
+    )
+    summaries = await summarize_all_levels(yt.text_with_timecodes or yt.text)
+
+    await _send_youtube_results(msg, yt, summaries)
+    await progress.delete()
+
+
+async def _send_youtube_results(msg: Message, yt: YouTubeTranscript, summaries: Summaries) -> None:
+    for body in (summaries.light, summaries.medium, summaries.full):
+        for chunk in _split_for_telegram(body):
+            await msg.answer(chunk)
+    src = "manual" if not yt.is_generated else "auto"
+    transcript_bytes = yt.text_with_timecodes.encode("utf-8")
+    filename = f"youtube_transcript_{yt.language}_{src}.txt"
+    await msg.answer_document(
+        BufferedInputFile(transcript_bytes, filename=filename),
+        caption=f"📄 Субтитры YouTube ({yt.language}, {src})",
+    )
 
 
 async def _download_from_url_with_progress(msg: Message, progress: Message, workdir: Path) -> MediaInfo:
