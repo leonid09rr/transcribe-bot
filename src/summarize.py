@@ -64,11 +64,14 @@ async def summarize_all_levels(transcript: str) -> Summaries:
     client = _get_client()
     model = _get_model()
 
-    tasks = [
-        _summarize_one(client, model, level_key, transcript)
-        for level_key in ("light", "medium", "full")
-    ]
-    light, medium, full = await asyncio.gather(*tasks)
+    # Сериализуем 3 уровня — на Free Tier (12k tokens/min) три параллельных
+    # запроса по ~5к токенов сразу пробивают лимит. Серийно с короткой паузой
+    # помещается в окно.
+    light = await _summarize_one(client, model, "light", transcript)
+    await asyncio.sleep(1)
+    medium = await _summarize_one(client, model, "medium", transcript)
+    await asyncio.sleep(1)
+    full = await _summarize_one(client, model, "full", transcript)
     return Summaries(light=light, medium=medium, full=full)
 
 
@@ -97,13 +100,26 @@ async def _summarize_one(client: Groq, model: str, level_key: str, transcript: s
             )
             await asyncio.sleep(delay)
         except GroqError as e:
+            msg = str(e)
+            is_rate_limit = "rate_limit" in msg.lower() or "429" in msg
+            if is_rate_limit and attempt < MAX_ATTEMPTS:
+                # На Free Tier токены восполняются раз в минуту — ждём долго.
+                wait = 30 * attempt
+                logger.warning(
+                    "Groq Llama rate limit hit (attempt %d/%d), waiting %ds",
+                    attempt, MAX_ATTEMPTS, wait,
+                )
+                await asyncio.sleep(wait)
+                continue
             logger.error(
                 "Groq Llama API error: type=%s repr=%r\n%s",
                 type(e).__name__, e, traceback.format_exc(),
             )
-            msg = str(e)
-            if "rate_limit" in msg.lower() or "429" in msg:
-                raise SummarizeError("Groq rate limit на Llama. Подожди минуту и попробуй снова.") from e
+            if is_rate_limit:
+                raise SummarizeError(
+                    "Groq rate limit на Llama исчерпан. Попробуй через 5 минут "
+                    "или подключи Groq Dev Tier (~$3/мес, лимиты в 30 раз выше)."
+                ) from e
             raise SummarizeError(f"Groq Llama API: {msg}") from e
 
     content = response.choices[0].message.content if response and response.choices else ""
