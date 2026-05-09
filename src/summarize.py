@@ -40,7 +40,9 @@ REQUEST_TIMEOUT_SEC = 120.0
 
 
 def _get_client() -> Groq:
-    api_key = os.getenv("GROQ_API_KEY")
+    # .strip() обязателен: Railway UI часто кладёт \n в конец секретов,
+    # из-за чего httpx падает с 'Illegal header value' до отправки запроса.
+    api_key = (os.getenv("GROQ_API_KEY") or "").strip()
     if not api_key:
         raise SummarizeError("GROQ_API_KEY не задан")
     return Groq(api_key=api_key, timeout=REQUEST_TIMEOUT_SEC, max_retries=0)

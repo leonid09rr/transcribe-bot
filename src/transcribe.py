@@ -47,7 +47,9 @@ class TranscribeError(Exception):
 
 
 def _get_client() -> Groq:
-    api_key = os.getenv("GROQ_API_KEY")
+    # .strip() обязателен: Railway UI часто кладёт \n в конец секретов,
+    # из-за чего httpx падает с 'Illegal header value' до отправки запроса.
+    api_key = (os.getenv("GROQ_API_KEY") or "").strip()
     if not api_key:
         raise TranscribeError("GROQ_API_KEY не задан в .env")
     return Groq(api_key=api_key, timeout=REQUEST_TIMEOUT_SEC, max_retries=0)

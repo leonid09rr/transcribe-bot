@@ -81,8 +81,11 @@ async def on_diag(msg: Message) -> None:
     import httpx
     from groq import Groq
 
-    api_key = os.getenv("GROQ_API_KEY", "")
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
     lines = [f"🔍 Диагностика Groq API"]
+    raw = os.getenv("GROQ_API_KEY", "")
+    if raw != api_key:
+        lines.append(f"⚠️ GROQ_API_KEY содержал {len(raw) - len(api_key)} лишних whitespace-байт — почистил локально")
 
     # Тест 1: чистый httpx GET к api.groq.com (без SDK).
     try:
@@ -101,7 +104,7 @@ async def on_diag(msg: Message) -> None:
     except Exception as e:
         lines.append(f"1. httpx GET → ❌ {type(e).__name__}: {str(e)[:200]}")
 
-    # Тест 2: Groq SDK models.list().
+    # Тест 2: Groq SDK models.list() — используем уже очищенный api_key.
     try:
         client = Groq(api_key=api_key, timeout=15.0, max_retries=0)
         models = await asyncio.to_thread(lambda: list(client.models.list().data))
