@@ -22,6 +22,13 @@ for stream in (sys.stdout, sys.stderr):
 ENV_PATH = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
+# Railway/UI при copy-paste нередко добавляет \n, \r, пробелы в значения секретов.
+# Это ломает HTTP-заголовки (Authorization: Bearer ...\n → Illegal header value).
+# Чистим все ENV-переменные сразу после загрузки.
+for _key, _val in list(os.environ.items()):
+    if isinstance(_val, str) and _val != _val.strip():
+        os.environ[_key] = _val.strip()
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
