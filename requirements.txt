@@ -1,0 +1,8 @@
+# Зависимости Telegram-бота транскрипции видео.
+# Установка: pip install -r requirements.txt
+
+aiogram==3.5.0          # Telegram-бот (async)
+python-dotenv==1.0.0    # Чтение .env
+groq>=0.11.0            # Groq API (Whisper + Llama 3.3)
+yt-dlp>=2024.10.0       # Скачивание видео по ссылкам (YouTube/Insta/TikTok/VK)
+aiofiles>=23.2.0        # Async работа с файлами

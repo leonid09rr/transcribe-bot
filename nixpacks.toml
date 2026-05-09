@@ -1,0 +1,8 @@
+# Конфиг для Railway (nixpacks).
+# Добавляем ffmpeg в системные пакеты — yt-dlp без него не сможет конвертировать аудио.
+
+[phases.setup]
+nixPkgs = ["python311", "ffmpeg"]
+
+[start]
+cmd = "python bot.py"
