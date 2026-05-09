@@ -35,9 +35,11 @@ logger = logging.getLogger(__name__)
 
 def _require_env(name: str) -> str:
     value = os.getenv(name)
-    if not value:
+    if value is None or not value.strip():
         raise SystemExit(f"❌ В .env не задана переменная {name}. См. .env.example")
-    return value
+    # В Railway/UI при copy-paste часто попадают \n, \r, пробелы по краям.
+    # Aiogram валидирует токен и падает на whitespace — чистим тихо.
+    return value.strip()
 
 
 async def main() -> None:
