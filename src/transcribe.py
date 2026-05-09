@@ -11,16 +11,20 @@ import logging
 import os
 from dataclasses import dataclass
 
-from groq import APIConnectionError, APITimeoutError, AsyncGroq, GroqError
+import traceback
+
+from groq import APIConnectionError, APITimeoutError, Groq, GroqError
 
 from .media import AudioChunk
 
 logger = logging.getLogger(__name__)
 
-# Groq иногда обрывает соединение или таймаутит. Делаем 3 попытки с backoff.
+# AsyncGroq в SDK 1.x имеет известные проблемы с file uploads из Docker —
+# рвёт коннекшн или таймаутит без явной причины. Используем sync Groq
+# через asyncio.to_thread — это надёжный workaround.
 MAX_ATTEMPTS = 3
 RETRY_BASE_DELAY = 2.0
-REQUEST_TIMEOUT_SEC = 120.0
+REQUEST_TIMEOUT_SEC = 180.0
 
 
 @dataclass
@@ -42,11 +46,11 @@ class TranscribeError(Exception):
     """Ошибки Groq, которые показываем пользователю."""
 
 
-def _get_client() -> AsyncGroq:
+def _get_client() -> Groq:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise TranscribeError("GROQ_API_KEY не задан в .env")
-    return AsyncGroq(api_key=api_key, timeout=REQUEST_TIMEOUT_SEC, max_retries=0)
+    return Groq(api_key=api_key, timeout=REQUEST_TIMEOUT_SEC, max_retries=0)
 
 
 def _get_model() -> str:
@@ -61,7 +65,11 @@ async def transcribe_chunks(chunks: list[AudioChunk], language: str | None = Non
     last_end = 0.0
 
     for i, chunk in enumerate(chunks):
-        logger.info("Whisper: чанк %d/%d (offset=%ds)", i + 1, len(chunks), chunk.start_seconds)
+        size_mb = chunk.path.stat().st_size / (1024 * 1024)
+        logger.info(
+            "Whisper: чанк %d/%d (offset=%ds, size=%.2fMB, model=%s)",
+            i + 1, len(chunks), chunk.start_seconds, size_mb, model,
+        )
         segments = await _transcribe_one(client, model, chunk, language)
         # Сдвигаем таймкоды на абсолютную позицию чанка.
         for seg in segments:
@@ -86,37 +94,41 @@ async def transcribe_chunks(chunks: list[AudioChunk], language: str | None = Non
 
 
 async def _transcribe_one(
-    client: AsyncGroq,
+    client: Groq,
     model: str,
     chunk: AudioChunk,
     language: str | None,
 ) -> list[TranscriptSegment]:
-    response = None
-    last_err: Exception | None = None
     with open(chunk.path, "rb") as f:
         audio_bytes = f.read()
 
+    response = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            response = await client.audio.transcriptions.create(
-                file=(chunk.path.name, audio_bytes),
-                model=model,
-                response_format="verbose_json",
-                language=language,
-                temperature=0,
+            response = await asyncio.to_thread(
+                _sync_call, client, model, chunk.path.name, audio_bytes, language,
             )
             break
         except (APIConnectionError, APITimeoutError) as e:
-            last_err = e
             if attempt == MAX_ATTEMPTS:
-                logger.warning("Groq connection error after %d attempts: %s", attempt, e)
+                logger.error(
+                    "Groq Whisper failed after %d attempts. type=%s repr=%r\n%s",
+                    attempt, type(e).__name__, e, traceback.format_exc(),
+                )
                 raise TranscribeError(
-                    "Groq не отвечает (network error). Попробуй ещё раз через минуту."
+                    f"Groq не отвечает ({type(e).__name__}). Попробуй ещё раз через минуту."
                 ) from e
             delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-            logger.warning("Groq attempt %d failed (%s), retry in %.1fs", attempt, type(e).__name__, delay)
+            logger.warning(
+                "Groq Whisper attempt %d/%d failed: %s (%s), retry in %.1fs",
+                attempt, MAX_ATTEMPTS, type(e).__name__, e, delay,
+            )
             await asyncio.sleep(delay)
         except GroqError as e:
+            logger.error(
+                "Groq Whisper API error: type=%s repr=%r\n%s",
+                type(e).__name__, e, traceback.format_exc(),
+            )
             msg = str(e)
             if "rate_limit" in msg.lower() or "429" in msg:
                 raise TranscribeError(
@@ -125,7 +137,7 @@ async def _transcribe_one(
             raise TranscribeError(f"Groq Whisper API: {msg}") from e
 
     if response is None:
-        raise TranscribeError(f"Groq Whisper API: {last_err}")
+        raise TranscribeError("Groq Whisper не вернул ответ.")
 
     segments_data = getattr(response, "segments", None) or []
     result: list[TranscriptSegment] = []
@@ -146,6 +158,16 @@ async def _transcribe_one(
             result.append(TranscriptSegment(start=0.0, end=0.0, text=full_text.strip()))
 
     return result
+
+
+def _sync_call(client: Groq, model: str, filename: str, audio_bytes: bytes, language: str | None):
+    return client.audio.transcriptions.create(
+        file=(filename, audio_bytes),
+        model=model,
+        response_format="verbose_json",
+        language=language,
+        temperature=0,
+    )
 
 
 def _format_with_timecodes(segments: list[TranscriptSegment]) -> str:
