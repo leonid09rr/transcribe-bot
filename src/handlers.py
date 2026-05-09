@@ -74,6 +74,67 @@ async def on_myid(msg: Message) -> None:
     await msg.answer(f"Твой Telegram ID: <code>{msg.from_user.id}</code>", parse_mode="HTML")
 
 
+@router.message(Command("diag"))
+async def on_diag(msg: Message) -> None:
+    """Диагностика связи с Groq API — отвечает что именно блокируется."""
+    import os
+    import httpx
+    from groq import Groq
+
+    api_key = os.getenv("GROQ_API_KEY", "")
+    lines = [f"🔍 Диагностика Groq API"]
+
+    # Тест 1: чистый httpx GET к api.groq.com (без SDK).
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as cli:
+            r = await cli.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        lines.append(f"1. httpx GET /v1/models → HTTP {r.status_code}")
+        if r.status_code == 200:
+            data = r.json()
+            count = len(data.get("data", []))
+            lines.append(f"   ✅ models: {count}")
+        else:
+            lines.append(f"   ⚠️ body: {r.text[:200]}")
+    except Exception as e:
+        lines.append(f"1. httpx GET → ❌ {type(e).__name__}: {str(e)[:200]}")
+
+    # Тест 2: Groq SDK models.list().
+    try:
+        client = Groq(api_key=api_key, timeout=15.0, max_retries=0)
+        models = await asyncio.to_thread(lambda: list(client.models.list().data))
+        lines.append(f"2. Groq SDK models.list() → ✅ {len(models)} моделей")
+    except Exception as e:
+        lines.append(f"2. Groq SDK models.list() → ❌ {type(e).__name__}: {str(e)[:200]}")
+
+    # Тест 3: реальная транскрипция тишины (250ms WAV).
+    try:
+        # Минимальный валидный WAV: 44 байта header + 8000 bytes mono 16-bit 8kHz silence.
+        wav_bytes = (
+            b"RIFF" + (8044).to_bytes(4, "little") + b"WAVEfmt " +
+            (16).to_bytes(4, "little") + (1).to_bytes(2, "little") +
+            (1).to_bytes(2, "little") + (8000).to_bytes(4, "little") +
+            (16000).to_bytes(4, "little") + (2).to_bytes(2, "little") +
+            (16).to_bytes(2, "little") + b"data" + (8000).to_bytes(4, "little") +
+            b"\x00" * 8000
+        )
+        client = Groq(api_key=api_key, timeout=30.0, max_retries=0)
+        result = await asyncio.to_thread(
+            lambda: client.audio.transcriptions.create(
+                file=("silence.wav", wav_bytes),
+                model=os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo"),
+                response_format="json",
+            )
+        )
+        lines.append(f"3. Whisper transcribe silence → ✅ ok")
+    except Exception as e:
+        lines.append(f"3. Whisper transcribe → ❌ {type(e).__name__}: {str(e)[:300]}")
+
+    await msg.answer("\n".join(lines))
+
+
 @router.message(Command("limits"))
 async def on_limits(msg: Message) -> None:
     user_id = msg.from_user.id

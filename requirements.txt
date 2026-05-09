@@ -7,3 +7,4 @@ groq>=0.11.0            # Groq API (Whisper + Llama 3.3)
 yt-dlp>=2024.10.0       # Скачивание видео по ссылкам (Insta/TikTok/VK/Rutube)
 youtube-transcript-api>=0.6.2  # Субтитры YouTube — обход блокировок yt-dlp
 aiofiles>=23.2.0        # Async работа с файлами
+httpx>=0.25.0           # HTTP клиент для /diag (тоже используется groq SDK)
