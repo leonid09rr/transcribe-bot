@@ -11,11 +11,16 @@ import logging
 import os
 from dataclasses import dataclass
 
-from groq import AsyncGroq, GroqError
+from groq import APIConnectionError, APITimeoutError, AsyncGroq, GroqError
 
 from .media import AudioChunk
 
 logger = logging.getLogger(__name__)
+
+# Groq иногда обрывает соединение или таймаутит. Делаем 3 попытки с backoff.
+MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY = 2.0
+REQUEST_TIMEOUT_SEC = 120.0
 
 
 @dataclass
@@ -41,7 +46,7 @@ def _get_client() -> AsyncGroq:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise TranscribeError("GROQ_API_KEY не задан в .env")
-    return AsyncGroq(api_key=api_key)
+    return AsyncGroq(api_key=api_key, timeout=REQUEST_TIMEOUT_SEC, max_retries=0)
 
 
 def _get_model() -> str:
@@ -86,22 +91,41 @@ async def _transcribe_one(
     chunk: AudioChunk,
     language: str | None,
 ) -> list[TranscriptSegment]:
-    try:
-        with open(chunk.path, "rb") as f:
+    response = None
+    last_err: Exception | None = None
+    with open(chunk.path, "rb") as f:
+        audio_bytes = f.read()
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
             response = await client.audio.transcriptions.create(
-                file=(chunk.path.name, f.read()),
+                file=(chunk.path.name, audio_bytes),
                 model=model,
                 response_format="verbose_json",
                 language=language,
                 temperature=0,
             )
-    except GroqError as e:
-        msg = str(e)
-        if "rate_limit" in msg.lower() or "429" in msg:
-            raise TranscribeError(
-                "Groq rate limit. Подожди немного или попробуй короче видео."
-            ) from e
-        raise TranscribeError(f"Groq Whisper API: {msg}") from e
+            break
+        except (APIConnectionError, APITimeoutError) as e:
+            last_err = e
+            if attempt == MAX_ATTEMPTS:
+                logger.warning("Groq connection error after %d attempts: %s", attempt, e)
+                raise TranscribeError(
+                    "Groq не отвечает (network error). Попробуй ещё раз через минуту."
+                ) from e
+            delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            logger.warning("Groq attempt %d failed (%s), retry in %.1fs", attempt, type(e).__name__, delay)
+            await asyncio.sleep(delay)
+        except GroqError as e:
+            msg = str(e)
+            if "rate_limit" in msg.lower() or "429" in msg:
+                raise TranscribeError(
+                    "Groq rate limit. Подожди немного или попробуй короче видео."
+                ) from e
+            raise TranscribeError(f"Groq Whisper API: {msg}") from e
+
+    if response is None:
+        raise TranscribeError(f"Groq Whisper API: {last_err}")
 
     segments_data = getattr(response, "segments", None) or []
     result: list[TranscriptSegment] = []

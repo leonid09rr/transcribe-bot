@@ -10,7 +10,7 @@ import logging
 import os
 from dataclasses import dataclass
 
-from groq import AsyncGroq, GroqError
+from groq import APIConnectionError, APITimeoutError, AsyncGroq, GroqError
 
 from .prompts import LEVELS
 
@@ -32,12 +32,16 @@ class SummarizeError(Exception):
 # 1 русский токен ≈ 2 символа, оставляем запас под промпт и ответ.
 MAX_TRANSCRIPT_CHARS = 200_000
 
+MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY = 2.0
+REQUEST_TIMEOUT_SEC = 120.0
+
 
 def _get_client() -> AsyncGroq:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise SummarizeError("GROQ_API_KEY не задан")
-    return AsyncGroq(api_key=api_key)
+    return AsyncGroq(api_key=api_key, timeout=REQUEST_TIMEOUT_SEC, max_retries=0)
 
 
 def _get_model() -> str:
@@ -67,21 +71,34 @@ async def summarize_all_levels(transcript: str) -> Summaries:
 async def _summarize_one(client: AsyncGroq, model: str, level_key: str, transcript: str) -> str:
     _, prompt_template = LEVELS[level_key]
     prompt = prompt_template.format(transcript=transcript)
-    try:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "Ты — редактор-конспектист. Отвечаешь на русском, кратко и по делу."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=4000,
-        )
-    except GroqError as e:
-        msg = str(e)
-        if "rate_limit" in msg.lower() or "429" in msg:
-            raise SummarizeError("Groq rate limit на Llama. Подожди минуту и попробуй снова.") from e
-        raise SummarizeError(f"Groq Llama API: {msg}") from e
+    response = None
 
-    content = response.choices[0].message.content if response.choices else ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "Ты — редактор-конспектист. Отвечаешь на русском, кратко и по делу."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=4000,
+            )
+            break
+        except (APIConnectionError, APITimeoutError) as e:
+            if attempt == MAX_ATTEMPTS:
+                logger.warning("Llama connection error after %d attempts: %s", attempt, e)
+                raise SummarizeError(
+                    "Groq не отвечает (network error). Попробуй ещё раз через минуту."
+                ) from e
+            delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            logger.warning("Llama attempt %d failed (%s), retry in %.1fs", attempt, type(e).__name__, delay)
+            await asyncio.sleep(delay)
+        except GroqError as e:
+            msg = str(e)
+            if "rate_limit" in msg.lower() or "429" in msg:
+                raise SummarizeError("Groq rate limit на Llama. Подожди минуту и попробуй снова.") from e
+            raise SummarizeError(f"Groq Llama API: {msg}") from e
+
+    content = response.choices[0].message.content if response and response.choices else ""
     return (content or "").strip()
